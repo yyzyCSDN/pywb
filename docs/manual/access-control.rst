@@ -322,3 +322,48 @@ Setting ``default_access: block`` and providing a list of ``allow`` rules provid
 to only a limited set of resources, and block access to anything out of scope by default.
 
 
+Revisit Payload Donor Access
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A revisit record only stores the HTTP headers of a capture: its payload body
+is borrowed from another capture, the *donor* (an earlier capture with the
+same payload digest, possibly of a different URL). By default, access is
+checked only for the requested capture, so a revisit may be replayed even
+though the donor that provides its body would be blocked for the current
+user.
+
+Setting ``revisit_donor_access: true`` for a collection enables an
+additional, opt-in authorization policy for revisit payload donors::
+
+  collections:
+       test:
+            acl_paths: ./path/to/file.aclj
+            default_access: block
+            revisit_donor_access: true
+
+When enabled, both the requested capture **and** the donor capture whose
+payload is actually borrowed must be allowed for the current ``X-Pywb-ACL-User``
+under the access rules and embargo, each checked against its own original
+URL, capture timestamp and owning collection. This applies both when the
+donor is located directly through the ``orig.filename``/``orig.offset``/
+``orig.length`` index fields and when it is re-queried from the revisit
+reference information (``WARC-Refers-To-Target-URI``/``WARC-Refers-To-Date``
+and payload digest).
+
+A donor that is ``block``-ed never provides the payload: if another allowed
+copy matching the revisit reference and digest exists, it is tried instead,
+otherwise the replay is refused explicitly (451 for a blocked donor, 404
+when all candidates are ``exclude``-d or missing). The replay never falls
+back to the live web and does not switch to another capture of the
+requested URL. Access decisions are always evaluated for the current user
+and the current rules; they are not shared between users, and a change of
+the rules takes effect on the next request.
+
+Revisits that do not borrow an external payload keep their usual handling:
+redirect revisits are replayed with an empty payload without a donor
+lookup, as are zero-length (empty digest) captures.
+
+The setting defaults to ``false``: when omitted or disabled, only the
+requested capture is authorized, as before.
+
+

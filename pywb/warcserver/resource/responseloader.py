@@ -188,13 +188,16 @@ class BaseLoader(object):
 
 #=============================================================================
 class WARCPathLoader(DefaultResolverMixin, BaseLoader):
-    def __init__(self, paths, cdx_source):
+    def __init__(self, paths, cdx_source, access_checker=None):
         self.paths = paths
 
         self.resolvers = self.make_resolvers(self.paths)
 
+        self.access_checker = access_checker
+
         self.resolve_loader = ResolvingLoader(self.resolvers,
-                                              no_record_parse=False)
+                                              no_record_parse=False,
+                                              access_checker=access_checker)
 
         self.headers_parser = StatusAndHeadersParser([], verify=False)
 
@@ -222,10 +225,19 @@ class WARCPathLoader(DefaultResolverMixin, BaseLoader):
                 yield cdx
 
         failed_files = []
+
+        # the current trusted ACL user, for the revisit donor
+        # authorization policy, if enabled
+        acl_user = None
+        input_req = params.get('_input_req')
+        if input_req:
+            acl_user = input_req.env.get('HTTP_X_PYWB_ACL_USER')
+
         headers, payload = (self.resolve_loader.
                              load_headers_and_payload(cdx,
                                                       failed_files,
-                                                      local_index_query))
+                                                      local_index_query,
+                                                      acl_user))
 
         http_headers_buff = None
 

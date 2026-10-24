@@ -7,6 +7,8 @@ from warcio.recordloader import ArchiveLoadFailed
 from pywb.warcserver.index.cdxobject import CDXException
 from pywb.warcserver.index.fuzzymatcher import FuzzyMatcher
 from pywb.warcserver.resource.responseloader import  WARCPathLoader, LiveWebLoader, VideoLoader
+from pywb.warcserver.resource.resolvingloader import RevisitDonorAccessException
+from pywb.warcserver.resource.resolvingloader import RevisitDonorNotFoundException
 
 import six
 import logging
@@ -167,6 +169,12 @@ class ResourceHandler(IndexHandler):
                     out_headers, resp = loader(cdx, params)
                     if resp is not None:
                         return out_headers, resp, errs
+                except (RevisitDonorAccessException,
+                        RevisitDonorNotFoundException):
+                    # revisit donor policy: refuse the replay explicitly,
+                    # never fall back to the live web nor switch to another
+                    # requested capture
+                    raise
                 except (WbException, ArchiveLoadFailed) as e:
                     last_exc = e
                     if logger.isEnabledFor(logging.DEBUG):
@@ -184,7 +192,9 @@ class DefaultResourceHandler(ResourceHandler):
     def __init__(self, index_source, warc_paths='', forward_proxy_prefix='',
                  use_local_file_load=False,
                  **kwargs):
-        loaders = [WARCPathLoader(warc_paths, index_source),
+        access_checker = kwargs.get('access_checker')
+        loaders = [WARCPathLoader(warc_paths, index_source,
+                                  access_checker=access_checker),
                    LiveWebLoader(forward_proxy_prefix, use_local_file_load=use_local_file_load),
                    VideoLoader()
                   ]

@@ -87,13 +87,20 @@ class AccessChecker(object):
     # another '#' (U+0023 > U+0020)
     EXACT_SUFFIX_SEARCH_B = b'####'  # type: bytes
 
-    def __init__(self, access_source, default_access='allow', embargo=None):
+    def __init__(self, access_source, default_access='allow', embargo=None,
+                 revisit_donor_access=False):
         """Initialize a new AccessChecker
 
         :param str|list[str]|AccessRulesAggregator access_source: An access source
         :param str default_access: The default access action (allow)
         :param dict embargo: A dict specifying optional embargo setting
+        :param bool revisit_donor_access: If True, the access rules and embargo
+            are also checked for the donor capture that provides the payload of
+            a revisit record, not only for the requested capture. Disabled by
+            default.
         """
+        self.revisit_donor_access = bool(revisit_donor_access)
+
         if isinstance(access_source, str):
             self.aggregator = self.create_access_aggregator([access_source])
         elif isinstance(access_source, list):
@@ -326,6 +333,72 @@ class AccessChecker(object):
 
         return last_obj if last_obj else self.default_rule
 
+    def get_access(self, url, timestamp, urlkey=None, collection=None,
+                   acl_user=None):
+        """Compute the access decision for a single capture.
+
+        The decision is always computed from the current access rules for the
+        supplied user; no result is cached or reused for another user, so a
+        change of the rules takes effect on the next request.
+
+        :param str url: The capture's own original URL
+        :param str timestamp: The capture's own capture timestamp
+        :param str|None urlkey: The access control url key, if available
+        :param str|None collection: The collection owning the capture, if any
+        :param str|None acl_user: The trusted access control user, if any
+        :return: ``'allow'`` (or another non-exclude access value such as
+                 ``'block'``), or ``None`` when the capture is ``exclude``-ed
+        :rtype: str|None
+        """
+        default_access = self.default_rule['access']
+
+        rule = None
+        access = None
+
+        if self.aggregator:
+            rule = self.find_access_rule(
+                url,
+                timestamp,
+                urlkey,
+                collection,
+                acl_user
+            )
+
+            access = rule.get('access', 'exclude')
+
+        access = self.check_date_access(
+            timestamp, access, default_access, rule
+        )
+
+        if access != 'allow_ignore_embargo' and access != 'exclude':
+            embargo_access = self.check_embargo(url, timestamp)
+            if embargo_access and embargo_access != 'allow':
+                access = embargo_access
+
+        if access == 'exclude':
+            return None
+
+        if not access:
+            access = default_access
+
+        if access == 'allow_ignore_embargo':
+            access = 'allow'
+
+        return access
+
+    def check_donor_access(self, cdx, acl_user):
+        """Return the access decision for a donor capture represented as a
+        CDX object, using the donor's own url, timestamp and owning collection.
+
+        :return: ``'allow'``/``'block'``/... or ``None`` when excluded
+        :rtype: str|None
+        """
+        return self.get_access(cdx.get('url'),
+                               cdx.get('timestamp'),
+                               cdx.get('urlkey'),
+                               cdx.get('source-coll'),
+                               acl_user)
+
     def __call__(self, res, acl_user):
         """Wraps the cdx iter in the supplied tuple returning a
         the wrapped cdx iter and the other members of the supplied
@@ -347,8 +420,6 @@ class AccessChecker(object):
         :param str acl_user: The user associated with this request (optional)
         :return: The wrapped cdx object iterator
         """
-        default_access = self.default_rule['access']
-
         for cdx in cdx_iter:
             url = cdx.get('url')
             timestamp = cdx.get('timestamp')
@@ -358,37 +429,15 @@ class AccessChecker(object):
                 yield cdx
                 continue
 
-            rule = None
-            access = None
+            access = self.get_access(url,
+                                     timestamp,
+                                     cdx.get('urlkey'),
+                                     cdx.get('source-coll'),
+                                     acl_user)
 
-            if self.aggregator:
-                rule = self.find_access_rule(
-                    url,
-                    timestamp,
-                    cdx.get('urlkey'),
-                    cdx.get('source-coll'),
-                    acl_user
-                )
-
-                access = rule.get('access', 'exclude')
-
-            access = self.check_date_access(
-                timestamp, access, default_access, rule
-            )
-
-            if access != 'allow_ignore_embargo' and access != 'exclude':
-                embargo_access = self.check_embargo(url, timestamp)
-                if embargo_access and embargo_access != 'allow':
-                    access = embargo_access
-
-            if access == 'exclude':
+            # excluded captures are removed entirely, as if they do not exist
+            if access is None:
                 continue
-
-            if not access:
-                access = default_access
-
-            if access == 'allow_ignore_embargo':
-                access = 'allow'
 
             cdx['access'] = access
             yield cdx

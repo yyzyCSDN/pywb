@@ -93,6 +93,11 @@ class WarcServer(BaseWarcServer):
 
         self.default_access = self.config.get('default_access')
 
+        # When enabled (default: disabled), revisit captures are replayed
+        # only when the donor capture providing the payload is allowed for
+        # the current ACL user under the same access rules and embargo
+        self.revisit_donor_access = bool(self.config.get('revisit_donor_access', False))
+
         self.rules_file = self.config.get('rules_file', '')
 
         if 'certificates' in self.config:
@@ -151,7 +156,8 @@ class WarcServer(BaseWarcServer):
         access_checker = AccessChecker(CacheDirectoryAccessSource(base_prefix=self.root_dir,
                                                                   base_dir=self.acl_paths,
                                                                   config=self.config),
-                                       self.default_access)
+                                       self.default_access,
+                                       revisit_donor_access=self.revisit_donor_access)
 
         if self.dedup_index_url:
             source = SimpleAggregator({'dedup': RedisMultiKeyIndexSource(self.dedup_index_url),
@@ -229,6 +235,7 @@ class WarcServer(BaseWarcServer):
             acl_paths = None
             default_access = self.default_access
             embargo = None
+            revisit_donor_access = self.revisit_donor_access
         elif isinstance(coll_config, dict):
             index = coll_config.get('index')
             if not index:
@@ -237,6 +244,8 @@ class WarcServer(BaseWarcServer):
             acl_paths = coll_config.get('acl_paths')
             default_access = coll_config.get('default_access', self.default_access)
             embargo = coll_config.get('embargo')
+            revisit_donor_access = bool(coll_config.get('revisit_donor_access',
+                                                        self.revisit_donor_access))
 
         else:
             raise Exception('collection config must be string or dict')
@@ -269,9 +278,13 @@ class WarcServer(BaseWarcServer):
             use_local_file_load = True
 
         # ACCESS CONFIG
+        # an access checker is also needed when the revisit donor policy is
+        # enabled, even without explicit acl paths or embargo, so that donor
+        # captures are checked under the default access rules
         access_checker = None
-        if acl_paths or embargo:
-            access_checker = AccessChecker(acl_paths, default_access, embargo)
+        if acl_paths or embargo or revisit_donor_access:
+            access_checker = AccessChecker(acl_paths, default_access, embargo,
+                                           revisit_donor_access=revisit_donor_access)
 
         return DefaultResourceHandler(agg, archive_paths,
                                       rules_file=self.rules_file,
