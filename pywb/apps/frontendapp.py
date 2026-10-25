@@ -11,6 +11,7 @@ from wsgiprox.wsgiprox import WSGIProxMiddleware
 from pywb.recorder.multifilewarcwriter import MultiFileWARCWriter
 from pywb.recorder.recorderapp import RecorderApp
 from pywb.recorder.filters import SkipDupePolicy, WriteDupePolicy, WriteRevisitDupePolicy
+from pywb.recorder.redaction import JsonRedactPolicy
 from pywb.recorder.redisindexer import WritableRedisIndexer, RedisPendingCounterTempBuffer
 
 from pywb.utils.loaders import load_yaml_config
@@ -263,9 +264,14 @@ class FrontEndApp(object):
         else:
             create_buff_func = None
 
+        # JSON response body redaction policy, disabled unless configured
+        json_redact = JsonRedactPolicy.from_config(
+            recorder_config.get('json_redact'))
+
         self.recorder = RecorderApp(self.RECORD_SERVER % str(self.warcserver_server.port), warc_writer,
                                     accept_colls=recorder_config.get('source_filter'),
-                                    create_buff_func=create_buff_func)
+                                    create_buff_func=create_buff_func,
+                                    json_redact=json_redact)
 
         recorder_server = GeventServer(self.recorder, port=0)
 

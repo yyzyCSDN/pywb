@@ -1,6 +1,9 @@
 import json
+import logging
 import tempfile
 import traceback
+
+from collections import deque
 
 import gevent
 import gevent.queue
@@ -10,19 +13,31 @@ from six.moves.urllib.parse import parse_qsl
 from warcio.recordloader import ArcWarcRecordLoader
 
 from pywb.recorder.filters import CollectionFilter, SkipRangeRequestFilter
+from pywb.recorder.redaction import RedactionFailure
 from pywb.utils.format import ParamFormatter
 from pywb.utils.io import BUFF_SIZE, StreamIter, no_except_close
 from pywb.warcserver.inputrequest import DirectWSGIInputRequest
 
 
+logger = logging.getLogger(__name__)
+
+
 # ==============================================================================
 class RecorderApp(object):
+    # possible results of processing one queued capture
+    RESULT_WRITTEN = 'written'
+    RESULT_REDACTED = 'redacted'
+    RESULT_REDACTION_FAILED = 'redaction_failed'
+
     def __init__(self, upstream_host, writer, skip_filters=None, **kwargs):
         self.upstream_host = upstream_host
 
         self.writer = writer
 
         self.rec_source_name = kwargs.get('name', 'recorder')
+
+        # JSON response body redaction policy, None when disabled (default)
+        self.json_redact = kwargs.get('json_redact')
 
         self.create_buff_func = kwargs.get('create_buff_func') or self.default_create_buffer
 
@@ -33,6 +48,12 @@ class RecorderApp(object):
             skip_filters = self.create_default_filters(kwargs)
 
         self.skip_filters = skip_filters
+
+        # observable capture processing results
+        self.record_counts = {self.RESULT_WRITTEN: 0,
+                              self.RESULT_REDACTED: 0,
+                              self.RESULT_REDACTION_FAILED: 0}
+        self.redaction_failures = deque(maxlen=100)
 
     @staticmethod
     def create_default_filters(kwargs):
@@ -55,20 +76,46 @@ class RecorderApp(object):
             except Exception:
                 traceback.print_exc()
 
+    def _note_result(self, result):
+        self.record_counts[result] = self.record_counts.get(result, 0) + 1
+
+    def _note_redaction_failure(self, uri, failure):
+        reason = getattr(failure, 'reason', 'error')
+        logger.warning('Skipping capture of %s: JSON redaction failed (%s)',
+                       uri, reason)
+        self.record_counts[self.RESULT_REDACTION_FAILED] += 1
+        self.redaction_failures.append({'url': uri, 'reason': reason})
+
     def _write_one(self):
         req_pay = None
         resp_pay = None
         try:
-            result = self.write_queue.get()
+            entry = self.write_queue.get()
 
-            req_head, req_pay, resp_head, resp_pay, params = result
+            req_head, req_pay, resp_head, resp_pay, params = entry
 
-            resp_length = resp_pay.tell()
             resp_pay.seek(0)
             resp = ArcWarcRecordLoader().parse_record_stream(resp_pay)
 
             if resp.rec_type == 'response':
                 uri = resp.rec_headers.get_header('WARC-Target-Uri')
+
+                result = self.RESULT_WRITTEN
+
+                if self.json_redact is not None:
+                    try:
+                        resp, redacted = self.json_redact.redact_response(
+                            resp, self.writer)
+                    except RedactionFailure as failure:
+                        # An in-scope response that could not be redacted is
+                        # never archived; the browser already received the
+                        # untouched upstream response.
+                        self._note_redaction_failure(uri, failure)
+                        return self.RESULT_REDACTION_FAILED
+
+                    if redacted:
+                        result = self.RESULT_REDACTED
+
                 req_length = req_pay.tell()
                 req_pay.seek(0)
                 req = self.writer.create_warc_record(uri=uri,
@@ -79,8 +126,13 @@ class RecorderApp(object):
 
                 self.writer.write_request_response_pair(req, resp, params)
 
+                self._note_result(result)
+                return result
+
             else:
                 self.writer.write_record(resp, params)
+                self._note_result(self.RESULT_WRITTEN)
+                return self.RESULT_WRITTEN
 
         finally:
             try:
