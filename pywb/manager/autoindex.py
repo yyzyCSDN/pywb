@@ -5,12 +5,17 @@ import os
 import logging
 
 from pywb.manager.manager import CollectionsManager
+from pywb.manager.batch import BatchManager
 
 
 #=============================================================================
 class AutoIndexer(object):
     EXT_RX = re.compile(r'.*\.w?arc(\.gz)?$')
     AUTO_INDEX_FILE = 'autoindex.cdxj'
+
+    # directories that must never be auto-indexed: published batch payloads
+    # are referenced by their dedicated indexes/batch-<id>.cdxj only
+    EXCLUDED_DIRS = frozenset([BatchManager.PUB_BATCHES_DIRNAME])
 
     def __init__(self, colls_dir=None, interval=30, keep_running=True):
         self.manager = CollectionsManager('', colls_dir=colls_dir, must_exist=False)
@@ -72,6 +77,9 @@ class AutoIndexer(object):
             logging.info('Checking Collection: ' + coll)
             to_index = []
             for dirpath, dirnames, filenames in os.walk(archive_dir):
+                # prune in-place: never auto-index published batch payloads
+                dirnames[:] = [d for d in dirnames
+                               if d not in self.EXCLUDED_DIRS]
                 for filename in filenames:
                     if not self.EXT_RX.match(filename):
                         continue

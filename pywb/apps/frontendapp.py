@@ -2,7 +2,7 @@ from gevent.monkey import patch_all; patch_all()
 
 from werkzeug.routing import Map, Rule, RequestRedirect, Submount
 from wsgiref.util import shift_path_info
-from six.moves.urllib.parse import urljoin, parse_qsl
+from six.moves.urllib.parse import urljoin, parse_qsl, urlencode
 from six import iteritems
 from warcio.utils import to_native_str
 from warcio.timeutils import iso_date_to_timestamp, timestamp_to_iso_date
@@ -12,6 +12,8 @@ from pywb.recorder.multifilewarcwriter import MultiFileWARCWriter
 from pywb.recorder.recorderapp import RecorderApp
 from pywb.recorder.filters import SkipDupePolicy, WriteDupePolicy, WriteRevisitDupePolicy
 from pywb.recorder.redisindexer import WritableRedisIndexer, RedisPendingCounterTempBuffer
+
+from pywb.manager.batch import BatchManager, BATCH_QUERY_PARAM
 
 from pywb.utils.loaders import load_yaml_config
 from pywb.utils.geventserver import GeventServer
@@ -51,7 +53,7 @@ class FrontEndApp(object):
     REPLAY_API = 'http://localhost:%s/{coll}/resource/postreq'
     CDX_API = 'http://localhost:%s/{coll}/index'
     RECORD_SERVER = 'http://localhost:%s'
-    RECORD_API = 'http://localhost:%s/%s/resource/postreq?param.recorder.coll={coll}'
+    RECORD_API = 'http://localhost:%s/%s/resource/postreq?param.recorder.coll={coll}&param.recorder.batch={batch}'
 
     RECORD_ROUTE = '/record'
 
@@ -249,12 +251,26 @@ class FrontEndApp(object):
             dedup_index = None
 
 
+        # pending-approval batches live inside the managed collections root
+        if self.warcserver.root_dir:
+            batch_store = BatchManager(self.warcserver.root_dir)
+            batch_dir_template = os.path.join(self.warcserver.root_dir,
+                                              '{coll}',
+                                              BatchManager.BATCHES_DIRNAME,
+                                              '{batch}',
+                                              BatchManager.BATCH_ARCHIVE_DIRNAME,
+                                              '')
+        else:
+            batch_store = None
+            batch_dir_template = None
+
         warc_writer = MultiFileWARCWriter(self.warcserver.archive_paths,
                                           max_size=int(recorder_config.get('rollover_size', 1000000000)),
                                           max_idle_secs=int(recorder_config.get('rollover_idle_secs', 600)),
                                           filename_template=recorder_config.get('filename_template'),
                                           dedup_index=dedup_index,
-                                          dedup_by_url=dedup_by_url)
+                                          dedup_by_url=dedup_by_url,
+                                          batch_dir_template=batch_dir_template)
 
         if dedup_policy:
             pending_counter = self.warcserver.dedup_index_url.replace(':cdxj', ':pending')
@@ -265,7 +281,10 @@ class FrontEndApp(object):
 
         self.recorder = RecorderApp(self.RECORD_SERVER % str(self.warcserver_server.port), warc_writer,
                                     accept_colls=recorder_config.get('source_filter'),
-                                    create_buff_func=create_buff_func)
+                                    create_buff_func=create_buff_func,
+                                    batch_store=batch_store,
+                                    batch_poll_interval=float(
+                                        recorder_config.get('batch_poll_interval', 1.0)))
 
         recorder_server = GeventServer(self.recorder, port=0)
 
@@ -456,6 +475,28 @@ class FrontEndApp(object):
         except Exception as e:
             return WbResponse.text_response('Error: ' + str(e), status='400 Bad Request')
 
+    @staticmethod
+    def _extract_batch_param(wb_url_str):
+        """Remove the ``batch`` selector from a record-mode wb url query.
+
+        The selector must not become part of the recorded target URL nor be
+        sent upstream; it is forwarded to the recorder separately as
+        ``param.recorder.batch``.
+
+        :return: (wb_url_str_without_batch, batch_id)
+        """
+        if '?' not in wb_url_str:
+            return wb_url_str, ''
+
+        base, query = wb_url_str.split('?', 1)
+        pairs = parse_qsl(query, keep_blank_values=True)
+        batch_values = [v for k, v in pairs if k == BATCH_QUERY_PARAM]
+        kept = [(k, v) for k, v in pairs if k != BATCH_QUERY_PARAM]
+        batch_id = batch_values[-1] if batch_values else ''
+        if kept:
+            base += '?' + urlencode(kept)
+        return base, batch_id
+
     def serve_record(self, environ, coll='$root', url=''):
         """Serve a URL's content from a WARC/ARC record in replay mode or from the live web in
         live, proxy, and record mode.
@@ -498,10 +539,17 @@ class FrontEndApp(object):
             if environ.get('QUERY_STRING'):
                 wb_url_str += '?' + environ.get('QUERY_STRING')
 
+        batch_id = ''
+        if record:
+            wb_url_str, batch_id = self._extract_batch_param(wb_url_str)
+
         coll_config = self.get_coll_config(coll)
         if record:
             coll_config['type'] = 'record'
             coll_config['cache'] = self.rec_cache_mode
+            # consumed by the 'record' upstream path template
+            # (param.recorder.batch); empty for ordinary recording
+            coll_config['batch'] = batch_id
 
         if timemap_output:
             coll_config['output'] = timemap_output
@@ -543,7 +591,7 @@ class FrontEndApp(object):
             headers["WARC-Date"] = timestamp_to_iso_date(timestamp)
 
         put_url = self.put_custom_record_path.format(
-            url=target_uri, coll=coll, rec_type=rec_type
+            url=target_uri, coll=coll, rec_type=rec_type, batch=''
         )
         res = requests.put(put_url, headers=headers, data=data)
 

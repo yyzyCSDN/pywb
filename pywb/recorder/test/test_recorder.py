@@ -644,3 +644,309 @@ class TestRecorder(LiveServerTests, HttpBinLiveTests, FakeRedisTests, TempDirTes
         assert status_headers.get_header('Content-Type') == 'application/vnd.youtube-dl_formats+json'
         assert status_headers.get_header('WARC-Block-Digest') != ''
         assert status_headers.get_header('WARC-Block-Digest') == status_headers.get_header('WARC-Payload-Digest')
+
+
+# ============================================================================
+class TestBatchRecorder(LiveServerTests, HttpBinLiveTests, FakeRedisTests,
+                       TempDirTests, BaseTestClass):
+    @classmethod
+    def setup_class(cls):
+        super(TestBatchRecorder, cls).setup_class()
+
+        cls.colls_dir = to_path(cls.root_dir + '/colls')
+        os.makedirs(os.path.join(cls.colls_dir, 'c1', 'archive'))
+        os.makedirs(os.path.join(cls.colls_dir, 'c1', 'indexes'))
+
+        from pywb.manager.batch import BatchManager
+        cls.bm = BatchManager(cls.colls_dir)
+        cls.upstream_url = 'http://localhost:{0}'.format(cls.server.port)
+
+        cls.warc_path = to_path(
+            cls.root_dir + '/colls/{coll}/archive/rec-test.warc.gz')
+        cls.batch_dir_template = to_path(
+            cls.root_dir + '/colls/{coll}/batches/{batch}/archive/')
+
+    def _make(self, dedup_index=None, poll=0.05):
+        writer = MultiFileWARCWriter(self.warc_path, dedup_index=dedup_index,
+                                     batch_dir_template=self.batch_dir_template)
+        recorder = RecorderApp(self.upstream_url, writer,
+                               batch_store=self.bm,
+                               batch_poll_interval=poll)
+        return writer, recorder, webtest.TestApp(recorder)
+
+    def _post(self, testapp, path='/get?foo=bar', extra=''):
+        url = 'http://httpbin.org' + path
+        req_url = '/live/resource/postreq?url=' + url + extra
+        return testapp.post(
+            req_url,
+            general_req_data.format(host='httpbin.org', path=path).encode('utf-8'),
+            expect_errors=True)
+
+    def _batch_archive(self, batch):
+        return os.path.join(self.colls_dir, 'c1', 'batches', batch, 'archive')
+
+    def _public_archive(self):
+        return os.path.join(self.colls_dir, 'c1', 'archive')
+
+    def test_batch_routing_admission_gate_counter(self):
+        self.bm.create_coll_batch('c1', 'b1')
+        writer, recorder, testapp = self._make()
+
+        resp = self._post(testapp, extra='&param.recorder.coll=c1'
+                                         '&param.recorder.batch=b1')
+        assert resp.status_int == 200
+        gevent.sleep(0.3)
+
+        batch_files = os.listdir(self._batch_archive('b1'))
+        assert len(batch_files) == 1 and batch_files[0].endswith('.warc.gz')
+        assert os.listdir(self._public_archive()) == []
+        assert self.bm.capture_count('c1', 'b1') == 0
+
+        # begin/end must be balanced for every accepted capture
+        begins = []
+        real_begin = self.bm.begin_capture
+        real_end = self.bm.end_capture
+        self.bm.begin_capture = lambda c, b: begins.append(1) or real_begin(c, b)
+        self.bm.end_capture = lambda c, b: (begins.pop(), real_end(c, b))[1] \
+            if begins else real_end(c, b)
+        try:
+            resp = self._post(testapp, path='/get?foo=baz',
+                              extra='&param.recorder.coll=c1'
+                                    '&param.recorder.batch=b1')
+            assert resp.status_int == 200
+            gevent.sleep(0.3)
+            assert begins == []
+        finally:
+            self.bm.begin_capture = real_begin
+            self.bm.end_capture = real_end
+
+        # sealed batch: rejected, not proxied, nothing new written
+        self.bm.seal_batch('c1', 'b1')
+        gevent.sleep(0.2)
+        mtime = os.path.getmtime(os.path.join(self._batch_archive('b1'),
+                                              batch_files[0]))
+        resp = self._post(testapp, path='/get?sealed=1',
+                          extra='&param.recorder.coll=c1'
+                                '&param.recorder.batch=b1')
+        assert resp.status_int == 403
+        assert 'not open' in resp.json['error_message']
+        assert os.listdir(self._batch_archive('b1')) == batch_files
+        assert self.bm.capture_count('c1', 'b1') == 0
+
+        # unbatched recording still goes to the public archive
+        resp = self._post(testapp, path='/get?pub=1',
+                          extra='&param.recorder.coll=c1')
+        assert resp.status_int == 200
+        gevent.sleep(0.3)
+        assert len(os.listdir(self._public_archive())) == 1
+
+        writer.close()
+
+    def test_batch_captures_skip_shared_dedup_index(self):
+        r = FakeStrictRedis.from_url('redis://localhost/2')
+        r.flushdb()
+
+        dedup_index = WritableRedisIndexer(
+            redis_url='redis://localhost/2/{coll}:cdxj',
+            file_key_template='{coll}:warc',
+            rel_path_template=to_path(self.root_dir + '/colls/c1/archive/'),
+            dupe_policy=WriteRevisitDupePolicy())
+
+        self.bm.create_coll_batch('c1', 'b2')
+        writer, recorder, testapp = self._make(dedup_index)
+
+        for q in ('/get?dedup=a', '/get?dedup=a'):
+            resp = self._post(testapp, path=q,
+                              extra='&param.recorder.coll=c1'
+                                    '&param.recorder.batch=b2')
+            assert resp.status_int == 200
+        gevent.sleep(0.3)
+
+        # batch captures never touch the shared redis dedup structures
+        assert r.zrange('c1:cdxj', 0, -1) == []
+        assert r.hgetall('c1:warc') == {}
+        # full response pairs are kept (no revisits)
+        files = os.listdir(self._batch_archive('b2'))
+        assert len(files) == 1
+        rec_types = []
+        with open(os.path.join(self._batch_archive('b2'), files[0]), 'rb') as fh:
+            for record in ArchiveIterator(fh):
+                rec_types.append(record.rec_type)
+        assert 'revisit' not in rec_types
+        assert rec_types.count('response') == 2
+
+        # unbatched capture populates dedup index as usual
+        resp = self._post(testapp, path='/get?dedup=z',
+                          extra='&param.recorder.coll=c1')
+        assert resp.status_int == 200
+        gevent.sleep(0.3)
+        assert len(r.zrange('c1:cdxj', 0, -1)) >= 1
+
+        writer.close()
+
+    def test_reaper_closes_sealed_batch_handles_only(self):
+        self.bm.create_coll_batch('c1', 'b3')
+        writer, recorder, testapp = self._make(poll=0.05)
+
+        resp = self._post(testapp, extra='&param.recorder.coll=c1'
+                                         '&param.recorder.batch=b3')
+        assert resp.status_int == 200
+        gevent.sleep(0.3)
+
+        batch_keys = [k for k in writer.fh_cache if 'batches' in k]
+        assert len(batch_keys) == 1
+
+        # a normal (public) capture handle must stay cached
+        resp = self._post(testapp, path='/get?keep=1',
+                          extra='&param.recorder.coll=c1')
+        assert resp.status_int == 200
+        gevent.sleep(0.3)
+        public_keys = [k for k in writer.fh_cache if 'batches' not in k]
+        assert len(public_keys) == 1
+
+        self.bm.seal_batch('c1', 'b3')
+        gevent.sleep(0.25)
+
+        assert not [k for k in writer.fh_cache if 'batches' in k]
+        # public handles are untouched by the batch reaper
+        assert all(k in writer.fh_cache for k in public_keys)
+
+        # released handle allows moving the batch WARC (required on Windows)
+        warc = os.path.join(self._batch_archive('b3'),
+                            os.listdir(self._batch_archive('b3'))[0])
+        backup = warc + '.bak'
+        os.rename(warc, backup)
+        os.rename(backup, warc)
+
+        writer.close()
+
+    def test_inflight_admission_count_blocks_seal_operations(self):
+        from types import SimpleNamespace
+        from io import BytesIO
+        from warcio.statusandheaders import StatusAndHeaders
+        from warcio.warcwriter import WARCWriter
+        from pywb.manager.batch import BatchError
+
+        # deterministic slow upstream: a complete WARC response record whose
+        # raw bytes become readable only after a gevent event is set
+        url = 'http://slow.example/x'
+        buf = BytesIO()
+        warc_writer = WARCWriter(buf, gzip=False)
+        warc_writer.write_record(warc_writer.create_warc_record(
+            url, 'response', payload=BytesIO(b'hello slow batch'),
+            http_headers=StatusAndHeaders(
+                'HTTP/1.1 200 OK',
+                [('Content-Type', 'text/plain')])))
+        warc_bytes = buf.getvalue()
+
+        release = gevent.event.Event()
+
+        class SlowRaw(object):
+            def __init__(self, data):
+                self.data = data
+                self.pos = 0
+
+            def read(self, n=-1):
+                if self.pos == 0:
+                    release.wait()
+                if self.pos >= len(self.data):
+                    return b''
+                if n is None or n < 0:
+                    n = len(self.data)
+                chunk = self.data[self.pos:self.pos + n]
+                self.pos += len(chunk)
+                return chunk
+
+            def close(self):
+                pass
+
+        def fake_request(*args, **kwargs):
+            return SimpleNamespace(status_code=200,
+                                   headers={'Content-Type': 'application/warc'},
+                                   raw=SlowRaw(warc_bytes),
+                                   raise_for_status=lambda: None)
+
+        self.bm.create_coll_batch('c1', 'b6')
+        writer, recorder, testapp = self._make(poll=0.05)
+
+        result = {}
+        req_url = ('/live/resource/postreq?url={0}'
+                   '&param.recorder.coll=c1&param.recorder.batch=b6'
+                   ).format(url)
+        req_body = general_req_data.format(
+            host='slow.example', path='/x').encode('utf-8')
+
+        def client():
+            try:
+                resp = testapp.post(req_url, req_body)
+                result['status'] = resp.status_int
+                result['body'] = resp.body
+            except Exception as exc:
+                result['error'] = exc
+
+        try:
+            with patch('pywb.recorder.recorderapp.requests') as fake_requests:
+                fake_requests.request.side_effect = fake_request
+
+                g = gevent.spawn(client)
+                gevent.sleep(0.5)
+
+                # admitted and stuck buffering the slow response -> counted
+                assert self.bm.capture_count('c1', 'b6') == 1
+
+                self.bm.seal_batch('c1', 'b6')
+                gevent.sleep(0.2)
+
+                # neither publish nor discard may proceed while in flight
+                with pytest.raises(BatchError):
+                    self.bm.discard_batch('c1', 'b6', wait=0.3, poll=0.05)
+                with pytest.raises(BatchError):
+                    self.bm.publish_batch('c1', 'b6', wait=0.3, poll=0.05)
+                assert self.bm.get_state('c1', 'b6') == 'sealed'
+
+                release.set()
+                g.join(timeout=5)
+
+            assert 'error' not in result
+            assert result['status'] == 200
+            assert self.bm.wait_drained('c1', 'b6', timeout=5.0)
+
+            # the admitted capture was written despite the seal
+            warcs = os.listdir(self._batch_archive('b6'))
+            assert len(warcs) == 1 and warcs[0].endswith('.warc.gz')
+
+            # discard can now complete and no payload is resurrected
+            writer.close()
+            gevent.sleep(0.2)
+            assert self.bm.discard_batch('c1', 'b6', wait=5.0) is True
+            assert os.listdir(self.bm.batch_dir('c1', 'b6')) == \
+                ['batch.yaml']
+        finally:
+            writer.close()
+
+    def test_put_record_batch_gate(self):
+        self.bm.create_coll_batch('c1', 'b4')
+        self.bm.seal_batch('c1', 'b4')
+        self.bm.create_coll_batch('c1', 'b5')
+        writer, recorder, testapp = self._make()
+
+        url = ('/live/resource/postreq?put_record=resource'
+               '&url=custom://example.com/data'
+               '&param.recorder.coll=c1&param.recorder.batch=b4')
+        resp = testapp.put(url, params=b'payload',
+                           headers={'content-type': 'text/plain'},
+                           expect_errors=True)
+        assert resp.status_int == 403
+        gevent.sleep(0.2)
+        assert os.listdir(self._batch_archive('b4')) == []
+        assert self.bm.capture_count('c1', 'b4') == 0
+
+        url = url.replace('batch=b4', 'batch=b5')
+        resp = testapp.put(url, params=b'payload',
+                           headers={'content-type': 'text/plain'})
+        assert resp.status_int == 200
+        gevent.sleep(0.3)
+        assert len(os.listdir(self._batch_archive('b5'))) == 1
+        assert self.bm.capture_count('c1', 'b5') == 0
+
+        writer.close()

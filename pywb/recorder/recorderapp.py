@@ -14,6 +14,8 @@ from pywb.utils.format import ParamFormatter
 from pywb.utils.io import BUFF_SIZE, StreamIter, no_except_close
 from pywb.warcserver.inputrequest import DirectWSGIInputRequest
 
+from pywb.manager.batch import RECORDER_BATCH_PARAM, STATE_OPEN, BatchManager
+
 
 # ==============================================================================
 class RecorderApp(object):
@@ -24,15 +26,77 @@ class RecorderApp(object):
 
         self.rec_source_name = kwargs.get('name', 'recorder')
 
+        # pending-approval batch store (single-process local deployments);
+        # None -> batch requests are rejected by the admission gate
+        self.batch_store = kwargs.get('batch_store')
+        self.batch_poll_interval = float(
+            kwargs.get('batch_poll_interval', 1.0))
+
         self.create_buff_func = kwargs.get('create_buff_func') or self.default_create_buffer
 
         self.write_queue = gevent.queue.Queue()
         gevent.spawn(self._write_loop)
 
+        if self.batch_store is not None:
+            self._batch_reaper = gevent.spawn(self._batch_reaper_loop)
+        else:
+            self._batch_reaper = None
+
         if not skip_filters:
             skip_filters = self.create_default_filters(kwargs)
 
         self.skip_filters = skip_filters
+
+    def _batch_reaper_loop(self):
+        """Close WARC file handles of sealed/discarded batches so that
+        publish/discard can move or delete the files."""
+        while True:
+            gevent.sleep(self.batch_poll_interval)
+            try:
+                self.writer.close_sealed_batch_files(
+                    self.batch_store.get_state)
+            except Exception:
+                traceback.print_exc()
+
+    def _check_batch_admission(self, params):
+        """Return an error message when a batch-scoped capture must not be
+        admitted; None when the capture may proceed."""
+        batch = params.get(RECORDER_BATCH_PARAM)
+        if not batch:
+            return None
+
+        if self.batch_store is None:
+            return 'batch recording is not enabled'
+
+        if not BatchManager.BATCH_RX.match(batch):
+            return 'invalid batch name: {0}'.format(batch)
+
+        coll = params.get('param.recorder.coll', '')
+        try:
+            state = self.batch_store.get_state(coll, batch)
+        except Exception:
+            traceback.print_exc()
+            return 'batch {0} could not be opened'.format(batch)
+
+        if state != STATE_OPEN:
+            return 'batch {0} is not open for recording'.format(batch)
+
+        return None
+
+    @staticmethod
+    def _batch_info(params, batch_store):
+        batch = params.get(RECORDER_BATCH_PARAM)
+        if not batch_store or not batch:
+            return None
+        return batch_store, params.get('param.recorder.coll', ''), batch
+
+    def _begin_capture(self, info):
+        if info:
+            info[0].begin_capture(info[1], info[2])
+
+    def _end_capture(self, info):
+        if info:
+            info[0].end_capture(info[1], info[2])
 
     @staticmethod
     def create_default_filters(kwargs):
@@ -58,10 +122,13 @@ class RecorderApp(object):
     def _write_one(self):
         req_pay = None
         resp_pay = None
+        batch_info = None
         try:
             result = self.write_queue.get()
 
             req_head, req_pay, resp_head, resp_pay, params = result
+
+            batch_info = self._batch_info(params, self.batch_store)
 
             resp_length = resp_pay.tell()
             resp_pay.seek(0)
@@ -83,6 +150,7 @@ class RecorderApp(object):
                 self.writer.write_record(resp, params)
 
         finally:
+            self._end_capture(batch_info)
             try:
                 if req_pay:
                     no_except_close(req_pay)
@@ -108,11 +176,18 @@ class RecorderApp(object):
     def _put_record(self, request_uri, input_buff, record_type,
                     headers, params, start_response):
 
+        # the pending capture was already counted at admission in
+        # handle_call; this method only owns the end-of-capture release
+        batch_info = self._batch_info(params, self.batch_store)
+
         if record_type == 'stream':
-            if self.writer.write_stream_to_file(params, input_buff):
-                msg = {'success': 'true'}
-            else:
-                msg = {'error_message': 'upload_error'}
+            try:
+                if self.writer.write_stream_to_file(params, input_buff):
+                    msg = {'success': 'true'}
+                else:
+                    msg = {'error_message': 'upload_error'}
+            finally:
+                self._end_capture(batch_info)
 
             return self.send_message(msg, '200 OK',
                                      start_response)
@@ -147,6 +222,7 @@ class RecorderApp(object):
                    'WARC-Date': record.rec_headers.get_header('WARC-Date')}
 
         finally:
+            self._end_capture(batch_info)
             if req_stream:
                 no_except_close(req_stream.out)
 
@@ -169,6 +245,27 @@ class RecorderApp(object):
         input_req = DirectWSGIInputRequest(environ)
 
         params = self._get_params(environ)
+
+        # batch admission gate: a sealed/missing batch is not proxied to the
+        # live web and nothing is written or counted
+        batch_error = self._check_batch_admission(params)
+        if batch_error:
+            return self.send_message({'error_message': batch_error},
+                                     '403 Forbidden', start_response)
+
+        # Count the capture at ADMISSION time, not when it reaches the write
+        # queue: a sealed batch's publish/discard must also wait for captures
+        # that were admitted but are still being proxied or buffered.
+        # Ownership is released either here (terminal branch without a queue
+        # entry) or by the write loop after the queued pair is written.
+        batch_info = self._batch_info(params, self.batch_store)
+        try:
+            self._begin_capture(batch_info)
+        except Exception:
+            traceback.print_exc()
+            return self.send_message(
+                {'error_message': 'batch unavailable, try again later'},
+                '503 Service Unavailable', start_response)
 
         request_uri = input_req.get_full_request_uri()
 
@@ -216,6 +313,8 @@ class RecorderApp(object):
                                    stream=True)
             res.raise_for_status()
         except Exception as e:
+            # admitted capture never produced a queued pair
+            self._end_capture(batch_info)
             if req_is_wrapped:
                 no_except_close(req_stream.out)
             return self.send_error(e, start_response)
@@ -234,9 +333,12 @@ class RecorderApp(object):
                                       params,
                                       self.write_queue,
                                       path,
-                                      self.create_buff_func)
+                                      self.create_buff_func,
+                                      batch_store=self.batch_store)
 
         else:
+            # filtered out: the admitted capture is not queued
+            self._end_capture(batch_info)
             resp_stream = res.raw
             if req_is_wrapped:
                 no_except_close(req_stream.out)
@@ -274,13 +376,14 @@ class Wrapper(object):
 # ==============================================================================
 class RespWrapper(Wrapper):
     def __init__(self, stream, headers, req,
-                 params, queue, path, create_func):
+                 params, queue, path, create_func, batch_store=None):
 
         super(RespWrapper, self).__init__(stream, params, create_func)
         self.headers = headers
         self.req = req
         self.queue = queue
         self.path = path
+        self.batch_store = batch_store
 
     def close(self):
         try:
@@ -301,23 +404,32 @@ class RespWrapper(Wrapper):
             self._write_to_file()
 
     def _write_to_file(self):
-        skipping = False
+        # The capture was counted at admission. Once the entry is queued,
+        # ownership transfers to the write loop (_write_one), which releases
+        # the count. On interruption or enqueue failure the entry never
+        # reaches the loop, so the admission count is released here.
+        enqueued = False
         try:
-            if self.interrupted:
-                skipping = True
-
-            if not skipping:
+            if not self.interrupted:
                 entry = (self.req.headers, self.req.out,
                          self.headers, self.out, self.params)
                 self.queue.put(entry)
+                enqueued = True
         except Exception:
             traceback.print_exc()
-            skipping = True
 
         finally:
-            if skipping:
+            if not enqueued:
                 no_except_close(self.out)
                 no_except_close(self.req.out)
+
+                batch_info = RecorderApp._batch_info(
+                    self.params, self.batch_store)
+                if batch_info:
+                    try:
+                        batch_info[0].end_capture(batch_info[1], batch_info[2])
+                    except Exception:
+                        traceback.print_exc()
 
             no_except_close(self.req)
             self.req = None

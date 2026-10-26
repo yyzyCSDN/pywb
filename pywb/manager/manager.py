@@ -263,10 +263,27 @@ directory structure expected by pywb
 
         tempdir.cleanup()
 
+    def _iter_public_archive_warcs(self):
+        """All archive WARCs eligible for the collection-wide index.
+
+        Published batch payloads live under ``archive/.batches`` and are
+        referenced solely by their per-batch ``indexes/batch-<id>.cdxj``
+        index, so they are excluded to avoid duplicate/partial entries.
+        """
+        from pywb.manager.batch import BatchManager
+
+        for dirpath, dirnames, filenames in os.walk(self.archive_dir):
+            dirnames[:] = [d for d in dirnames
+                           if d != BatchManager.PUB_BATCHES_DIRNAME]
+            for filename in filenames:
+                if self.WARC_RX.match(filename):
+                    yield os.path.join(dirpath, filename)
+
     def reindex(self):
         cdx_file = os.path.join(self.indexes_dir, self.DEF_INDEX_FILE)
         logging.info('Indexing ' + self.archive_dir + ' to ' + cdx_file)
-        self._cdx_index(cdx_file, [self.archive_dir])
+        warcs = list(self._iter_public_archive_warcs())
+        self._cdx_index(cdx_file, warcs, os.path.abspath(self.archive_dir))
 
     def _cdx_index(self, out, input_, rel_root=None):
         from pywb.indexer.cdxindexer import write_multi_cdx_index
@@ -579,6 +596,89 @@ Create manage file based web archive collections
     template.add_argument('--remove')
     template.add_argument('--list', action='store_true')
     template.set_defaults(func=do_add_template)
+
+    # Pending-approval batches
+    def do_batch(r):
+        from pywb.manager.batch import BatchManager
+
+        m = CollectionsManager(r.coll_name, must_exist=True)
+        bm = BatchManager(m.colls_dir)
+
+        if r.action == 'create':
+            bm.create_coll_batch(r.coll_name, r.batch)
+            print('Created batch {0} in collection {1}'.format(
+                r.batch, r.coll_name))
+
+        elif r.action == 'list':
+            batches = bm.list_batches(r.coll_name)
+            print('Batches in {0}:'.format(r.coll_name))
+            if not batches:
+                print('(none)')
+            for name, state in batches:
+                print('- {0}: {1}'.format(name, state))
+
+        elif r.action == 'seal':
+            bm.seal_batch(r.coll_name, r.batch)
+            print('Sealed batch {0} in collection {1}'.format(
+                r.batch, r.coll_name))
+
+        elif r.action == 'publish':
+            changed = bm.publish_batch(r.coll_name, r.batch, wait=r.wait)
+            if changed:
+                print('Published batch {0} in collection {1}'.format(
+                    r.batch, r.coll_name))
+            else:
+                print('Batch {0} is already published'.format(r.batch))
+
+        elif r.action == 'discard':
+            changed = bm.discard_batch(r.coll_name, r.batch, wait=r.wait)
+            if changed:
+                print('Discarded batch {0} in collection {1}'.format(
+                    r.batch, r.coll_name))
+            else:
+                print('Batch {0} is already discarded'.format(r.batch))
+
+    batch_help = ('Manage pending-approval batches inside a collection: '
+                  'create, list, seal, publish, discard')
+    batch = subparsers.add_parser('batch', help=batch_help)
+    batch_sub = batch.add_subparsers(dest='action')
+    batch_sub.required = True
+
+    batch_create = batch_sub.add_parser(
+        'create', help='Create a new open batch in an existing collection')
+    batch_create.add_argument('coll_name')
+    batch_create.add_argument('batch')
+    batch_create.set_defaults(func=do_batch)
+
+    batch_list = batch_sub.add_parser(
+        'list', help='List batches and their states in a collection')
+    batch_list.add_argument('coll_name')
+    batch_list.set_defaults(func=do_batch)
+
+    batch_seal = batch_sub.add_parser(
+        'seal', help='Seal a batch: stop accepting captures, let in-flight '
+                     'captures finish')
+    batch_seal.add_argument('coll_name')
+    batch_seal.add_argument('batch')
+    batch_seal.set_defaults(func=do_batch)
+
+    batch_publish = batch_sub.add_parser(
+        'publish', help='Validate and atomically publish a sealed batch')
+    batch_publish.add_argument('coll_name')
+    batch_publish.add_argument('batch')
+    batch_publish.add_argument('--wait', type=float, default=30.0,
+                               help='Seconds to wait for in-flight captures '
+                                    'and released file handles')
+    batch_publish.set_defaults(func=do_batch)
+
+    batch_discard = batch_sub.add_parser(
+        'discard', help='Discard a sealed batch, removing all its payloads')
+    batch_discard.add_argument('coll_name')
+    batch_discard.add_argument('batch')
+    batch_discard.add_argument('--wait', type=float, default=30.0,
+                               help='Seconds to wait for in-flight captures '
+                                    'and released file handles')
+    batch_discard.set_defaults(func=do_batch)
 
     # Migrate CDX
     def do_migrate(r):

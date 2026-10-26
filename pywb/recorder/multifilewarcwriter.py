@@ -11,6 +11,11 @@ from warcio.warcwriter import BaseWARCWriter
 from pywb.utils.format import res_template
 from pywb.utils.io import no_except_close
 
+from pywb.manager.batch import (
+    RECORDER_BATCH_PARAM,
+    STATE_SEALED, STATE_DISCARDED, STATE_PUBLISHED,
+)
+
 
 # ============================================================================
 class MultiFileWARCWriter(BaseWARCWriter):
@@ -29,6 +34,9 @@ class MultiFileWARCWriter(BaseWARCWriter):
 
         self.dir_template = dir_template
         self.key_template = kwargs.get('key_template', self.dir_template)
+        # template used when a capture is recorded into a pending-approval
+        # batch, e.g. <root>/{coll}/batches/{batch}/archive/
+        self.batch_dir_template = kwargs.pop('batch_dir_template', None)
         self.dedup_index = kwargs.get('dedup_index')
         self.dedup_by_url = kwargs.get('dedup_by_url')
         self.filename_template = filename_template
@@ -40,8 +48,22 @@ class MultiFileWARCWriter(BaseWARCWriter):
 
         self.fh_cache = {}
 
+    def _is_batch_write(self, params):
+        """Batch captures are isolated from the shared dedup index until the
+        batch is published, so they never produce revisits."""
+        return bool(self.batch_dir_template and
+                    params.get(RECORDER_BATCH_PARAM))
+
+    def _get_dir_templates(self, params):
+        if self._is_batch_write(params):
+            return self.batch_dir_template, self.batch_dir_template
+        return self.dir_template, self.key_template
+
     def _check_revisit(self, record, params):
         if not self.dedup_index or record.rec_type != 'response':
+            return record
+
+        if self._is_batch_write(params):
             return record
 
         # ensure payload digest is computed at this point
@@ -90,7 +112,7 @@ class MultiFileWARCWriter(BaseWARCWriter):
 
         fh = open(filename, 'a+b')
 
-        if self.dedup_index:
+        if self.dedup_index and not self._is_batch_write(params):
             self.dedup_index.add_warc_file(filename, params)
 
         return fh
@@ -170,8 +192,11 @@ class MultiFileWARCWriter(BaseWARCWriter):
         return self._write_to_file(params, write_callback)
 
     def _write_to_file(self, params, write_callback):
-        full_dir = res_template(self.dir_template, params)
-        dir_key = self.get_dir_key(params)
+        dir_template, key_template = self._get_dir_templates(params)
+        is_batch_write = self._is_batch_write(params)
+
+        full_dir = res_template(dir_template, params)
+        dir_key = res_template(key_template, params)
 
         result = self.fh_cache.get(dir_key)
 
@@ -203,7 +228,7 @@ class MultiFileWARCWriter(BaseWARCWriter):
 
             out.seek(start)
 
-            if self.dedup_index:
+            if self.dedup_index and not is_batch_write:
                 self.dedup_index.add_urls_to_index(out, params,
                                                    filename,
                                                    new_size - start)
@@ -259,6 +284,39 @@ class MultiFileWARCWriter(BaseWARCWriter):
             if (now - mtime) > self.max_idle_time:
                 print('Closing idle ' + filename)
                 self.close_key(dir_key)
+
+    # states in which a batch must no longer hold an open WARC handle:
+    # a sealed/discarded batch accepts no new captures, and publish/discard
+    # need to move or delete its files (not possible on Windows while a
+    # handle is open). A missing (None) or published batch is also closed.
+    BATCH_CLOSED_STATES = frozenset([None, STATE_SEALED,
+                                     STATE_DISCARDED, STATE_PUBLISHED])
+
+    def close_sealed_batch_files(self, state_getter):
+        """Close cached file handles belonging to batches that no longer
+        accept captures. ``state_getter(coll, batch)`` returns the batch
+        state or None when it is missing. Returns [(coll, batch)] closed.
+        """
+        from pywb.manager.batch import BatchManager
+
+        closed = []
+        for dir_key, out, filename in list(self.iter_open_files()):
+            parsed = BatchManager.parse_batch_archive_path(dir_key)
+            if not parsed:
+                continue
+
+            coll, batch = parsed
+            try:
+                state = state_getter(coll, batch)
+            except Exception:
+                traceback.print_exc()
+                continue
+
+            if state in self.BATCH_CLOSED_STATES and \
+                    self.close_key(dir_key):
+                closed.append((coll, batch))
+
+        return closed
 
 
 # ============================================================================
