@@ -61,4 +61,10 @@ enable_memento: true
 
 rules_config: pkg://pywb/rules.yaml
 
+# Shared secret used to sign verifiable replay references (the ``vr_``
+# replay modifier). When unset a random secret is generated per process, so
+# references stop verifying across restarts. Set a stable value to keep
+# previously minted references replayable.
+#verifiable_replay_secret: change-me
+
 

@@ -139,9 +139,17 @@ class ResolvingLoader(object):
             for path in possible_paths:
                 any_found = True
                 try:
-                    return (self.record_loader.
-                            load(path, offset, length,
-                                 no_record_parse=self.no_record_parse))
+                    record = (self.record_loader.
+                              load(path, offset, length,
+                                   no_record_parse=self.no_record_parse))
+                    # remember the logical locator (from the index) that was
+                    # used to load this record, so a verifiable replay
+                    # reference can be minted from the actually loaded
+                    # header/payload records, including a revisit donor
+                    record.source_filename = filename
+                    record.source_offset = str(offset)
+                    record.source_length = str(length)
+                    return record
 
                 except Exception as ue:
                     last_exc = ue
@@ -160,6 +168,16 @@ class ResolvingLoader(object):
 
         # raise ArchiveLoadFailed(msg, filename), None, last_traceback
         six.reraise(ArchiveLoadFailed, ArchiveLoadFailed(filename + ': ' + msg), last_traceback)
+
+    def load_pinned_record(self, cdx, failed_files):
+        """Load the single, explicitly selected record described by ``cdx``.
+
+        Unlike the regular resolve path, this never performs a candidate
+        search (no revisit dupe lookup, no closest/first match) -- the exact
+        filename/offset/length row selected and verified by the caller is the
+        only record that gets loaded.
+        """
+        return self._resolve_path_load(cdx, False, failed_files)
 
     def _load_different_url_payload(self, cdx, headers_record,
                                     failed_files, cdx_loader):

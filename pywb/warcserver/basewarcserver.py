@@ -1,7 +1,7 @@
 from pywb.warcserver.inputrequest import DirectWSGIInputRequest, POSTInputRequest
 from pywb.utils.format import query_to_dict
 
-from pywb.utils.wbexception import AccessException
+from pywb.utils.wbexception import AccessException, WbException
 
 from werkzeug.routing import Map, Rule
 from werkzeug.exceptions import HTTPException
@@ -34,6 +34,7 @@ class BaseWarcServer(object):
             params['mode'] = mode
             if path_param_value:
                 params[path_param_name] = path_param_value
+            params['_route'] = path
             params['_input_req'] = DirectWSGIInputRequest(environ)
             return handler(params)
 
@@ -42,6 +43,7 @@ class BaseWarcServer(object):
             params['mode'] = mode
             if path_param_value:
                 params[path_param_name] = path_param_value
+            params['_route'] = path
             params['_input_req'] = POSTInputRequest(environ)
             return handler(params)
 
@@ -97,6 +99,11 @@ class BaseWarcServer(object):
             res = self.json_encode(ae.msg, out_headers)
             start_response(ae.status(), list(out_headers.items()))
             return res
+
+        except WbException as wbe:
+            # explicit warcserver errors (bad request, record unavailable,
+            # not found, ...) carry their own HTTP status
+            return self.send_error({'last_exc': wbe}, start_response)
 
         except Exception as e:
             if self.debug:

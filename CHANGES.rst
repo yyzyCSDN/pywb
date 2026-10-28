@@ -1,3 +1,8 @@
+pywb 2.7.4 changelist
+~~~~~~~~~~~~~~~~~~~~~
+
+* Add verifiable replay references for a single captured HTTP resource (``vr_`` replay modifier): a signed reference minted for a selected local capture is bound to its collection, the concrete header record and payload record (including a resolved revisit donor) and the payload digest. Replaying it never silently switches to another capture, explicitly reports 410 when a bound record or donor no longer matches, can not carry arbitrary file paths or cross collections, and stays subject to the collection's current access rules. Ordinary url/timestamp replay is unchanged and archived redirects still lead to normal replay, so this does not snapshot page subresources.
+
 pywb 2.7.3 changelist
 ~~~~~~~~~~~~~~~~~~~~~
 

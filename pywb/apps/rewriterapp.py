@@ -17,8 +17,9 @@ from pywb.rewrite.wburl import WbUrl
 from pywb.utils.canonicalize import canonicalize
 from pywb.utils.io import BUFF_SIZE, OffsetLimitReader, no_except_close
 from pywb.utils.memento import MementoUtils
-from pywb.utils.wbexception import NotFoundException, UpstreamException
+from pywb.utils.wbexception import NotFoundException, UpstreamException, BadRequestException
 from pywb.warcserver.index.cdxobject import CDXObject
+from pywb.warcserver.vrref import VR_MOD, VR_URN_PREFIX, parse_claims, strip_urn
 
 
 # ============================================================================
@@ -320,13 +321,59 @@ class RewriterApp(object):
         environ['pywb.app_prefix'] = environ.get('SCRIPT_NAME', '')
         environ['pywb.static_prefix'] = environ['pywb.host_prefix'] + environ['pywb.app_prefix'] + '/' + self.static_prefix
 
+    @staticmethod
+    def _vr_url(full_prefix, token):
+        """The archival URL that replays the resource bound to ``token``."""
+        return full_prefix + VR_MOD + '/' + VR_URN_PREFIX + token
+
+    def _apply_vr_ref(self, wb_url, kwargs):
+        """Resolve a ``vr_`` request to the claims of its verifiable replay
+        reference.  The token is opaque to the front end (the warcserver
+        verifies its signature), the unsigned claims are only used to bind
+        the url/timestamp for rendering and the collection for routing.
+        """
+        try:
+            token = strip_urn(wb_url.url)
+            claims = parse_claims(token)
+        except Exception as e:
+            raise BadRequestException(url=wb_url.url,
+                                      msg='Invalid verifiable replay reference: {0}'.format(e))
+
+        coll = kwargs.get('coll', '$root')
+        bound_coll = claims['coll'] or '$root'
+        if bound_coll != coll:
+            raise BadRequestException(
+                url=wb_url.url,
+                msg='Verifiable replay reference is bound to collection '
+                    '"{0}" and can not be used in "{1}"'.format(bound_coll, coll))
+
+        wb_url.url = claims['url']
+        wb_url.timestamp = claims['ts']
+        wb_url.type = wb_url.REPLAY
+        # render like a normal replay, but keep the token for the upstream
+        # pinned lookup and for same-resource framework redirects
+        wb_url.vr_ref = token
+        wb_url.mod = self.replay_mod
+        return wb_url, token
+
     def render_content(self, wb_url, kwargs, environ):
         wb_url = wb_url.replace('#', '%23')
         wb_url = WbUrl(wb_url)
 
+        # verifiable replay reference: /<coll>/vr_/urn:vr:<token>
+        # resolve the opaque token to its bound url/timestamp for ordinary
+        # rendering; the token itself is passed upstream for strict pinned
+        # replay
+        vr_ref = None
+        if wb_url.mod == VR_MOD:
+            wb_url, vr_ref = self._apply_vr_ref(wb_url, kwargs)
+
         history_page = environ.pop('HTTP_X_WOMBAT_HISTORY_PAGE', '')
         if history_page:
+            # history ajax targets another url, not the pinned resource
             wb_url.url = history_page
+            wb_url.vr_ref = None
+            vr_ref = None
             is_ajax = True
         else:
             is_ajax = self.is_ajax(environ)
@@ -351,8 +398,9 @@ class RewriterApp(object):
         else:
             content_rw = self.default_rw
 
-        # no redirects if in proxy
-        redirect_to_exact = self.redirect_to_exact and not is_proxy
+        # no redirects if in proxy; a verifiable replay reference is already
+        # exact: framework redirects would only risk dropping the binding
+        redirect_to_exact = self.redirect_to_exact and not is_proxy and not vr_ref
 
         # Check Prefer
         pref_mod, pref_applied = self._get_prefer_mod(wb_url, environ,
@@ -408,7 +456,10 @@ class RewriterApp(object):
 
         url_parts = urlsplit(wb_url.url)
         if not url_parts.path:
-            return self.send_redirect('/', url_parts, urlrewriter)
+            # for a pinned resource serve directly instead of redirecting to
+            # a different archival URL that would drop the binding
+            if not vr_ref:
+                return self.send_redirect('/', url_parts, urlrewriter)
 
         self.unrewrite_referrer(environ, full_prefix)
 
@@ -432,6 +483,9 @@ class RewriterApp(object):
                 inputreq.extra_cookie, setcookie_headers = res
 
         r = self._do_req(inputreq, wb_url, kwargs, skip_record)
+
+        # verifiable replay reference minted upstream for this exact capture
+        minted_vr_ref = r.headers.get('Warcserver-Vr-Ref')
 
         if r.status_code >= 400:
             error = None
@@ -459,12 +513,15 @@ class RewriterApp(object):
         cdx_url_parts = urlsplit(cdx['url'])
 
         if cdx_url_parts.path.endswith('/') and not url_parts.path.endswith('/'):
-            # add trailing slash
-            new_path = url_parts.path + '/'
+            # add trailing slash, unless this is a pinned resource: the
+            # reference already selects the record, so the same-resource
+            # redirect would only lose the binding
+            if not vr_ref:
+                new_path = url_parts.path + '/'
 
-            no_except_close(r.raw)
+                no_except_close(r.raw)
 
-            return self.send_redirect(new_path, url_parts, urlrewriter)
+                return self.send_redirect(new_path, url_parts, urlrewriter)
 
 
         # only redirect to exact if not live, otherwise set to false
@@ -524,7 +581,11 @@ class RewriterApp(object):
             head_insert_func = None
             urlrewriter.rewrite_opts['is_ajax'] = True
         else:
-            top_url = self.get_top_url(full_prefix, wb_url, cdx, kwargs)
+            if vr_ref:
+                # frame/banner navigation must stay bound to this resource
+                top_url = self._vr_url(full_prefix, vr_ref)
+            else:
+                top_url = self.get_top_url(full_prefix, wb_url, cdx, kwargs)
             head_insert_func = (self.head_insert_view.
                                 create_insert_func(wb_url,
                                                    full_prefix,
@@ -581,8 +642,13 @@ class RewriterApp(object):
             set_content_loc = True
 
         if set_content_loc and not redirect_to_exact and not is_proxy:
-            status_headers.headers.append(('Content-Location', urlrewriter.get_new_url(timestamp=cdx['timestamp'],
-                                                                                       url=cdx['url'])))
+            if vr_ref:
+                # identifying the selected memento must keep the binding
+                content_location = self._vr_url(full_prefix, vr_ref)
+            else:
+                content_location = urlrewriter.get_new_url(timestamp=cdx['timestamp'],
+                                                            url=cdx['url'])
+            status_headers.headers.append(('Content-Location', content_location))
 
         if not is_proxy:
             self.add_csp_header(wb_url, status_headers)
@@ -591,6 +657,12 @@ class RewriterApp(object):
 
         if is_proxy and environ.get('HTTP_ORIGIN'):
             response.add_access_control_headers(environ)
+
+        # expose the verifiable replay reference of this exact capture so a
+        # client can save and later replay the same record
+        if minted_vr_ref and not is_ajax:
+            response.status_headers['Vr-Ref'] = self._vr_url(full_prefix,
+                                                             minted_vr_ref)
 
         if r.status_code == 200 and kwargs.get('cache') == 'always' and environ.get('HTTP_REFERER'):
             response.status_headers['Cache-Control'] = 'public, max-age=31536000, immutable'
@@ -733,6 +805,12 @@ class RewriterApp(object):
             closest = wb_url.timestamp
 
         params = {'url': wb_url.url, 'closest': closest, 'matchType': 'exact'}
+
+        # verifiable replay reference: upstream must serve the exact records
+        # the token is bound to instead of selecting by closest timestamp
+        vr_ref = getattr(wb_url, 'vr_ref', None)
+        if vr_ref:
+            params['vrref'] = vr_ref
 
         if wb_url.mod == 'vi_':
             params['content_type'] = self.VIDEO_INFO_CONTENT_TYPE

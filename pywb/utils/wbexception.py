@@ -80,6 +80,22 @@ class NotFoundException(WbException):
 
 
 # =================================================================
+class RecordUnavailableException(WbException):
+    """An Exception used to indicate that a previously capturable record is
+    no longer available for replay (a pinned record or its donor can no
+    longer be located or verified)"""
+
+    @property
+    def status_code(self):
+        """Returns the HTTP status code for the error response (410)
+
+        :return: The status code for the error response (410)
+        :rtype: int
+        """
+        return 410
+
+
+# =================================================================
 class LiveResourceException(WbException):
     """An Exception used to indicate that an error was encountered during the
     retrial of a live web resource"""

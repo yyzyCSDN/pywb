@@ -1,7 +1,11 @@
+import base64
 import datetime
+import hashlib
 import json
 import logging
 import os
+import tempfile
+import traceback
 import uuid
 from io import BytesIO
 
@@ -15,6 +19,7 @@ from warcio.timeutils import (
     datetime_to_timestamp,
     http_date_to_datetime,
     iso_date_to_datetime,
+    iso_date_to_timestamp,
     timestamp_to_datetime
 )
 from warcio.utils import to_native_str
@@ -24,11 +29,12 @@ from pywb.utils.format import ParamFormatter
 from pywb.utils.io import StreamIter, call_release_conn, compress_gzip_iter, no_except_close
 from pywb.utils.memento import MementoUtils
 from pywb.utils.refresh import parse_refresh
-from pywb.utils.wbexception import LiveResourceException
+from pywb.utils.wbexception import LiveResourceException, RecordUnavailableException
 from pywb.warcserver.http import DefaultAdapters
 from pywb.warcserver.liveurlfilter import LiveUrlFilter
 from pywb.warcserver.resource.pathresolvers import DefaultResolverMixin
 from pywb.warcserver.resource.resolvingloader import ResolvingLoader
+from pywb.warcserver.vrref import VRReferenceCodec, digest_algorithm, digest_value
 
 logger = logging.getLogger('warcserver')
 
@@ -56,6 +62,11 @@ class BaseLoader(object):
 
         out_headers['Warcserver-Cdx'] = to_native_str(cdx.to_cdxj().rstrip())
         out_headers['Warcserver-Source-Coll'] = to_native_str(source)
+
+        # verifiable replay reference minted for this exact local capture
+        vr_ref = cdx.get('_vr_ref')
+        if vr_ref:
+            out_headers['Warcserver-Vr-Ref'] = to_native_str(vr_ref)
 
         if not warc_headers:
             if other_headers:
@@ -188,7 +199,7 @@ class BaseLoader(object):
 
 #=============================================================================
 class WARCPathLoader(DefaultResolverMixin, BaseLoader):
-    def __init__(self, paths, cdx_source):
+    def __init__(self, paths, cdx_source, vr_codec=None):
         self.paths = paths
 
         self.resolvers = self.make_resolvers(self.paths)
@@ -199,6 +210,9 @@ class WARCPathLoader(DefaultResolverMixin, BaseLoader):
         self.headers_parser = StatusAndHeadersParser([], verify=False)
 
         self.cdx_source = cdx_source
+
+        # codec used to mint verifiable replay references for local captures
+        self.vr_codec = vr_codec or VRReferenceCodec()
 
     def load_resource(self, cdx, params):
         if cdx.get('_cached_result'):
@@ -227,6 +241,155 @@ class WARCPathLoader(DefaultResolverMixin, BaseLoader):
                                                       failed_files,
                                                       local_index_query))
 
+        # mint before _assemble_entry(), which rewrites the payload record's
+        # target uri/date headers to the (revisit) header record's values
+        self._mint_vr_ref(cdx, params, headers, payload)
+
+        entry = self._assemble_entry(cdx, params, headers, payload)
+
+        return entry
+
+    def load_pinned(self, header_cdx, payload_cdx, claims, params):
+        """Replay the exact records described by a verifiable replay
+        reference, without any candidate search.
+
+        ``header_cdx`` and ``payload_cdx`` are the rows of the *current*
+        index that exactly match every locator of the signed reference; the
+        physical records are loaded from their locators and their identity
+        and payload fingerprint are verified before anything is replayed.
+        """
+        # path resolvers expand collection templates (eg. '{coll}') from the
+        # row formatter, exactly as in ordinary replay
+        for row in (header_cdx, payload_cdx):
+            if row is not None:
+                row._formatter = ParamFormatter(params,
+                                                row.get('source', '').split(':')[0])
+
+        failed_files = []
+        headers = self.resolve_loader.load_pinned_record(header_cdx,
+                                                          failed_files)
+
+        if payload_cdx is not None:
+            payload = self.resolve_loader.load_pinned_record(payload_cdx,
+                                                              failed_files)
+        else:
+            payload = headers
+
+        try:
+            self._verify_pinned(claims, headers, payload)
+            entry = self._assemble_entry(header_cdx, params, headers, payload)
+        except RecordUnavailableException:
+            no_except_close(headers.raw_stream)
+            if payload is not headers:
+                no_except_close(payload.raw_stream)
+            raise
+
+        # echo the reference instead of re-minting: the replay stays bound
+        # to exactly this token
+        header_cdx['_vr_ref'] = params.get('vrref')
+        header_cdx['_cached_result'] = entry
+
+        return self(header_cdx, params)
+
+    @staticmethod
+    def _record_ts(record):
+        warc_date = record.rec_headers.get_header('WARC-Date')
+        if warc_date:
+            return iso_date_to_timestamp(warc_date)
+        return ''
+
+    def _verify_pinned(self, claims, headers, payload):
+        """Verify that the loaded records are still exactly the records the
+        reference was minted for, and that the actual payload matches the
+        bound fingerprint.  Spools the payload while hashing it so a digest
+        mismatch is reported before a single byte is replayed."""
+        h_uri = headers.rec_headers.get_header('WARC-Target-URI')
+        if h_uri != claims['url']:
+            raise RecordUnavailableException(
+                'Verifiable replay reference unavailable: header record '
+                'target uri changed ({0} != {1})'.format(h_uri, claims['url']))
+
+        h_ts = self._record_ts(headers)
+        if h_ts and h_ts != claims['ts']:
+            raise RecordUnavailableException(
+                'Verifiable replay reference unavailable: header record '
+                'date changed ({0} != {1})'.format(h_ts, claims['ts']))
+
+        if claims['rec_type'] == 'revisit':
+            if headers.rec_type != 'revisit':
+                raise RecordUnavailableException(
+                    'Verifiable replay reference unavailable: bound record '
+                    'is no longer a revisit')
+
+            if payload is not headers:
+                p_uri = payload.rec_headers.get_header('WARC-Target-URI')
+                if p_uri != claims['p_url']:
+                    raise RecordUnavailableException(
+                        'Verifiable replay reference unavailable: revisit '
+                        'donor target uri changed ({0} != {1})'.format(
+                            p_uri, claims['p_url']))
+
+                p_ts = self._record_ts(payload)
+                if p_ts and p_ts != claims['p_ts']:
+                    raise RecordUnavailableException(
+                        'Verifiable replay reference unavailable: revisit '
+                        'donor date changed ({0} != {1})'.format(
+                            p_ts, claims['p_ts']))
+
+                # the revisit header must still point at this donor
+                ref_uri = headers.rec_headers.get_header(
+                    'WARC-Refers-To-Target-URI')
+                if ref_uri and ref_uri != p_uri:
+                    raise RecordUnavailableException(
+                        'Verifiable replay reference unavailable: revisit no '
+                        'longer refers to the bound donor')
+        else:
+            if headers.rec_type == 'revisit':
+                raise RecordUnavailableException(
+                    'Verifiable replay reference unavailable: bound record '
+                    'is now a revisit')
+
+        # redirect revisit optimization: the header record carries the 3xx
+        # and is replayed with a zero-length body, no donor record is bound
+        # (p == h), so there is no payload fingerprint to verify -- the
+        # record locator and identity checks above pin the actual record
+        if payload is headers and claims['rec_type'] == 'revisit':
+            http_headers = headers.http_headers
+            status_code = http_headers and http_headers.get_statuscode()
+            if status_code and status_code.startswith('3'):
+                return
+
+        self._verify_payload_digest(payload, claims['digest'])
+
+    @staticmethod
+    def _verify_payload_digest(record, expected_digest):
+        expected = digest_value(expected_digest)
+        algo = digest_algorithm(expected_digest)
+
+        spool = tempfile.SpooledTemporaryFile(max_size=1024 * 1024, mode='w+b')
+        hasher = hashlib.new(algo)
+        try:
+            while True:
+                buff = record.raw_stream.read(65536)
+                if not buff:
+                    break
+                hasher.update(buff)
+                spool.write(buff)
+
+            actual = base64.b32encode(hasher.digest()).decode('ascii').rstrip('=')
+            if actual.upper() != expected.upper():
+                raise RecordUnavailableException(
+                    'Verifiable replay reference unavailable: payload '
+                    'fingerprint does not match ({0}: {1} != {2})'.format(
+                        algo, actual, expected))
+        finally:
+            spool.seek(0)
+            record.raw_stream = spool
+
+    def _assemble_entry(self, cdx, params, headers, payload):
+        """Build the (warc_headers, http_headers_buff, payload_stream) tuple
+        returned to BaseLoader from the resolved/verified header and payload
+        records."""
         http_headers_buff = None
 
         if payload.rec_type in ('response', 'revisit'):
@@ -281,6 +444,47 @@ class WARCPathLoader(DefaultResolverMixin, BaseLoader):
             no_except_close(headers.raw_stream)
 
         return (warc_headers, http_headers_buff, payload.raw_stream)
+
+    def _mint_vr_ref(self, cdx, params, headers, payload):
+        """Mint the verifiable replay reference bound to the actually loaded
+        header and payload records (including a resolved donor for revisits)
+        and stash it on the cdx so BaseLoader can expose it as a response
+        header."""
+        if not self.vr_codec or cdx.get('_vr_ref'):
+            return
+        coll = params.get('_coll')
+        if coll is None:
+            return
+        try:
+            header_loc = (cdx.get('filename'),
+                          str(cdx.get('offset')),
+                          str(cdx.get('length', '-')))
+
+            payload_loc = (getattr(payload, 'source_filename', None) or
+                           cdx.get('filename'),
+                           str(getattr(payload, 'source_offset', None) or
+                               cdx.get('offset')),
+                           str(getattr(payload, 'source_length', None) or
+                               cdx.get('length', '-')))
+
+            payload_uri = payload.rec_headers.get_header('WARC-Target-URI') or cdx['url']
+            payload_ts = self._record_ts(payload) or cdx['timestamp']
+
+            cdx['_vr_ref'] = self.vr_codec.mint(
+                coll=coll,
+                url=cdx['url'],
+                timestamp=cdx['timestamp'],
+                digest=cdx.get('digest', ''),
+                rec_type=headers.rec_type or payload.rec_type or 'response',
+                header_loc=header_loc,
+                payload_loc=payload_loc,
+                payload_url=payload_uri,
+                payload_ts=payload_ts)
+        except Exception as e:
+            # minting a reference must never break ordinary replay
+            if logger.isEnabledFor(logging.DEBUG):
+                traceback.print_exc()
+            logger.debug('could not mint verifiable replay reference: ' + str(e))
 
     def __str__(self):
         return  'WARCPathLoader'

@@ -21,6 +21,8 @@ from pywb.warcserver.index.zipnum import ZipNumIndexSource
 
 from pywb.warcserver.access_checker import AccessChecker, CacheDirectoryAccessSource
 
+from pywb.warcserver.vrref import VRReferenceCodec
+
 from pywb import DEFAULT_CONFIG
 
 from six import iteritems, iterkeys, itervalues
@@ -90,6 +92,11 @@ class WarcServer(BaseWarcServer):
         self.index_paths = self.init_paths('index_paths')
         self.archive_paths = self.init_paths('archive_paths', self.root_dir)
         self.acl_paths = self.init_paths('acl_paths')
+
+        # shared codec for verifiable replay references; a configured secret
+        # keeps references valid across restarts, otherwise a random secret
+        # is generated per process
+        self.vr_codec = VRReferenceCodec(self.config.get('verifiable_replay_secret'))
 
         self.default_access = self.config.get('default_access')
 
@@ -164,7 +171,8 @@ class WarcServer(BaseWarcServer):
 
         return DefaultResourceHandler(source, self.archive_paths,
                                       rules_file=self.rules_file,
-                                      access_checker=access_checker)
+                                      access_checker=access_checker,
+                                      vr_codec=self.vr_codec)
 
     def list_fixed_routes(self):
         return list(self.fixed_routes.keys())
@@ -276,7 +284,8 @@ class WarcServer(BaseWarcServer):
         return DefaultResourceHandler(agg, archive_paths,
                                       rules_file=self.rules_file,
                                       access_checker=access_checker,
-                                      use_local_file_load=use_local_file_load)
+                                      use_local_file_load=use_local_file_load,
+                                      vr_codec=self.vr_codec)
 
     def init_sequence(self, coll_name, seq_config, cache_name=None):
         if not isinstance(seq_config, list):
